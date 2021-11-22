@@ -10,6 +10,7 @@ const build_options = @import("build_options");
 const trace = @import("tracy.zig").trace;
 const Cache = @import("Cache.zig");
 const Package = @import("Package.zig");
+const symbols_reader = @import("glibc_symbols_reader.zig");
 
 pub const Lib = struct {
     name: []const u8,
@@ -23,7 +24,7 @@ pub const Fn = struct {
 
 pub const VerList = struct {
     /// 7 is just the max number, we know statically it's big enough.
-    versions: [7]u8,
+    versions: [44]u8,
     len: u8,
 };
 
@@ -57,9 +58,43 @@ pub const LoadMetaDataError = error{
     OutOfMemory,
 };
 
+pub fn targetStringToTriple(t: []const u8) !target_util.ArchOsAbi{
+    var component_it = mem.tokenize(u8, target_string, "-");
+    const arch_name = component_it.next() orelse {
+        std.log.err("symbols: expected arch name", .{});
+        return error.ZigInstallationCorrupt;
+    };
+    const os_name = component_it.next() orelse {
+        std.log.err("symbols: expected OS name", .{});
+        return error.ZigInstallationCorrupt;
+    };
+    const abi_name = component_it.next() orelse {
+        std.log.err("symbols: expected ABI name", .{});
+        return error.ZigInstallationCorrupt;
+    };
+    const arch_tag = std.meta.stringToEnum(std.Target.Cpu.Arch, arch_name) orelse {
+        std.log.err("symbols: unrecognized arch: '{s}'", .{ arch_name });
+        return error.ZigInstallationCorrupt;
+    };
+    if (!mem.eql(u8, os_name, "linux")) {
+        std.log.err("symbols: expected OS 'linux', found '{s}'", .{ os_name });
+        return error.ZigInstallationCorrupt;
+    }
+    const abi_tag = std.meta.stringToEnum(std.Target.Abi, abi_name) orelse {
+        std.log.err("symbols: unrecognized ABI: '{s}'", .{ abi_name });
+        return error.ZigInstallationCorrupt;
+    };
+    const triple = target_util.ArchOsAbi{
+        .arch = arch_tag,
+        .os = .linux,
+        .abi = abi_tag,
+    };
+    return triple;
+}
+
 /// This function will emit a log error when there is a problem with the zig installation and then return
 /// `error.ZigInstallationCorrupt`.
-pub fn loadMetaData(gpa: *Allocator, zig_lib_dir: std.fs.Dir) LoadMetaDataError!*ABI {
+pub fn loadMetaData(gpa: *Allocator, zig_lib_dir: std.fs.Dir, target_version: ?std.builtin.Version) LoadMetaDataError!*ABI {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -78,150 +113,171 @@ pub fn loadMetaData(gpa: *Allocator, zig_lib_dir: std.fs.Dir) LoadMetaDataError!
     };
     defer glibc_dir.close();
 
-    const max_txt_size = 500 * 1024; // Bigger than this and something is definitely borked.
-    const vers_txt_contents = glibc_dir.readFileAlloc(gpa, "vers.txt", max_txt_size) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            std.log.err("unable to read vers.txt: {s}", .{@errorName(err)});
-            return error.ZigInstallationCorrupt;
-        },
+    const symbols_file = glibc_dir.openFile("symbols", .{ .read = true }) catch |err| {
+        std.log.err("unable to open symbols file: {s}", .{@errorName(err)});
+        return error.ZigInstallationCorrupt;
     };
-    defer gpa.free(vers_txt_contents);
-
-    // Arena allocated because the result contains references to function names.
-    const fns_txt_contents = glibc_dir.readFileAlloc(arena, "fns.txt", max_txt_size) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            std.log.err("unable to read fns.txt: {s}", .{@errorName(err)});
-            return error.ZigInstallationCorrupt;
-        },
+    const symbols_data = symbols_reader.readSymbolsFile(arena, symbols_file) catch |err| {
+        std.log.err("unable to read symbols file: {s}", .{@errorName(err)});
+        return error.ZigInstallationCorrupt;
     };
 
-    const abi_txt_contents = glibc_dir.readFileAlloc(gpa, "abi.txt", max_txt_size) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            std.log.err("unable to read abi.txt: {s}", .{@errorName(err)});
+    // Collect versions
+    for (symbols_data.all_versions.items) |version_string| {
+        const prefix = "GLIBC_";
+        if (!mem.startsWith(u8, version_string, prefix)) {
+            std.log.err("symbols: glib version '{s}' expected 'GLIBC_' prefix", .{version_string});
             return error.ZigInstallationCorrupt;
-        },
-    };
-    defer gpa.free(abi_txt_contents);
-
-    {
-        var it = mem.tokenize(u8, vers_txt_contents, "\r\n");
-        var line_i: usize = 1;
-        while (it.next()) |line| : (line_i += 1) {
-            const prefix = "GLIBC_";
-            if (!mem.startsWith(u8, line, prefix)) {
-                std.log.err("vers.txt:{d}: expected 'GLIBC_' prefix", .{line_i});
-                return error.ZigInstallationCorrupt;
-            }
-            const adjusted_line = line[prefix.len..];
-            const ver = std.builtin.Version.parse(adjusted_line) catch |err| {
-                std.log.err("vers.txt:{d}: unable to parse glibc version '{s}': {s}", .{ line_i, line, @errorName(err) });
-                return error.ZigInstallationCorrupt;
-            };
-            try all_versions.append(arena, ver);
         }
+        const adjusted_line = version_string[prefix.len..];
+        const ver = std.builtin.Version.parse(adjusted_line) catch |err| {
+            std.log.err("symbols: unable to parse glibc version '{s}': {s}", .{ version_string, @errorName(err) });
+            return error.ZigInstallationCorrupt;
+        };
+        try all_versions.append(arena, ver);
     }
-    {
-        var file_it = mem.tokenize(u8, fns_txt_contents, "\r\n");
-        var line_i: usize = 1;
-        while (file_it.next()) |line| : (line_i += 1) {
-            var line_it = mem.tokenize(u8, line, " ");
-            const fn_name = line_it.next() orelse {
-                std.log.err("fns.txt:{d}: expected function name", .{line_i});
-                return error.ZigInstallationCorrupt;
-            };
-            const lib_name = line_it.next() orelse {
-                std.log.err("fns.txt:{d}: expected library name", .{line_i});
-                return error.ZigInstallationCorrupt;
-            };
-            const lib = findLib(lib_name) orelse {
-                std.log.err("fns.txt:{d}: unknown library name: {s}", .{ line_i, lib_name });
-                return error.ZigInstallationCorrupt;
-            };
-            try all_functions.append(arena, .{
-                .name = fn_name,
-                .lib = lib,
-            });
-        }
+
+    // Collect abi targets and initialize version_table
+    for (symbols_data.all_targets.items) |target_string| {
+        const triple = try targetStringToTriple(target_string);
+        // TODO - change this later, to use real number of functions. Right now
+        // symbols_data.symbols.items.len includes all inclusions, so symbol
+        // duplication will happen.
+        const ver_list_base = try arena.alloc(VerList, symbols_data.symbols.items.len);
+        try version_table.put(gpa, triple, ver_list_base.ptr);
     }
-    {
-        var file_it = mem.split(u8, abi_txt_contents, "\n");
-        var line_i: usize = 0;
-        while (true) {
-            const ver_list_base: []VerList = blk: {
-                const line = file_it.next() orelse break;
-                if (line.len == 0) break;
-                line_i += 1;
-                const ver_list_base = try arena.alloc(VerList, all_functions.items.len);
-                var line_it = mem.tokenize(u8, line, " ");
-                while (line_it.next()) |target_string| {
-                    var component_it = mem.tokenize(u8, target_string, "-");
-                    const arch_name = component_it.next() orelse {
-                        std.log.err("abi.txt:{d}: expected arch name", .{line_i});
-                        return error.ZigInstallationCorrupt;
-                    };
-                    const os_name = component_it.next() orelse {
-                        std.log.err("abi.txt:{d}: expected OS name", .{line_i});
-                        return error.ZigInstallationCorrupt;
-                    };
-                    const abi_name = component_it.next() orelse {
-                        std.log.err("abi.txt:{d}: expected ABI name", .{line_i});
-                        return error.ZigInstallationCorrupt;
-                    };
-                    const arch_tag = std.meta.stringToEnum(std.Target.Cpu.Arch, arch_name) orelse {
-                        std.log.err("abi.txt:{d}: unrecognized arch: '{s}'", .{ line_i, arch_name });
-                        return error.ZigInstallationCorrupt;
-                    };
-                    if (!mem.eql(u8, os_name, "linux")) {
-                        std.log.err("abi.txt:{d}: expected OS 'linux', found '{s}'", .{ line_i, os_name });
-                        return error.ZigInstallationCorrupt;
+
+    // Collect symbols information
+    // TODO - remove included_symbols once target_version check is added
+    // var included_symbols = std.StringHashMap(bool).init(arena_allocator);
+    for (symbols_data.symbols.items) |symbol, symbol_i| {
+        // // Prevent double inclusion of symbols - temporary solution
+        // const gop = included_symbols.getOrPut(symbol.name);
+        // if(gop.found_existing){
+        //     continue;
+        // }
+
+        const lib = findLib(symbol.lib) orelse {
+            std.log.err("symbols:{s} unknown library name: {s}", .{ symbol.name, symbol.lib });
+            return error.ZigInstallationCorrupt;
+        };
+        try all_functions.append(arena, .{
+            .name = symbol.name,
+            .lib = lib,
+        });
+
+        // Populate verlist
+        for(symbol.targets.items)|target_string|{
+            const triple = try targetStringToTriple(target_string);
+            var version_table_gop = version_table.getOrPut(triple);
+            if(version_table_gop.found_existing){
+                // TODO use all versions correctly. Now this is for testing only
+                var glibc_version_index = 0;
+                for(all_versions)|version_string, version_index|{
+                    if(std.mem.eql(u8, symbol.versions.items[0], version_string)){
+                        glibc_version_index = version_index;
+                        break;
                     }
-                    const abi_tag = std.meta.stringToEnum(std.Target.Abi, abi_name) orelse {
-                        std.log.err("abi.txt:{d}: unrecognized ABI: '{s}'", .{ line_i, abi_name });
-                        return error.ZigInstallationCorrupt;
-                    };
-
-                    const triple = target_util.ArchOsAbi{
-                        .arch = arch_tag,
-                        .os = .linux,
-                        .abi = abi_tag,
-                    };
-                    try version_table.put(gpa, triple, ver_list_base.ptr);
                 }
-                break :blk ver_list_base;
-            };
-            for (ver_list_base) |*ver_list| {
-                const line = file_it.next() orelse {
-                    std.log.err("abi.txt:{d}: missing version number line", .{line_i});
-                    return error.ZigInstallationCorrupt;
-                };
-                line_i += 1;
 
-                ver_list.* = .{
-                    .versions = undefined,
-                    .len = 0,
+                // This is a pointer to ver_list_base which has a length of symbols_data.symbols.items.len
+                version_table_gop.value_ptr[symbol_i] = .{
+                    .versions = [1]u8{glibc_version_index},
+                    .len = 1,
                 };
-                var line_it = mem.tokenize(u8, line, " ");
-                while (line_it.next()) |version_index_string| {
-                    if (ver_list.len >= ver_list.versions.len) {
-                        // If this happens with legit data, increase the array len in the type.
-                        std.log.err("abi.txt:{d}: too many versions", .{line_i});
-                        return error.ZigInstallationCorrupt;
-                    }
-                    const version_index = std.fmt.parseInt(u8, version_index_string, 10) catch |err| {
-                        // If this happens with legit data, increase the size of the integer type in the struct.
-                        std.log.err("abi.txt:{d}: unable to parse version: {s}", .{ line_i, @errorName(err) });
-                        return error.ZigInstallationCorrupt;
-                    };
-
-                    ver_list.versions[ver_list.len] = version_index;
-                    ver_list.len += 1;
-                }
             }
         }
     }
+
+
+
+
+    // const max_txt_size = 500 * 1024; // Bigger than this and something is definitely borked.
+    // const abi_txt_contents = glibc_dir.readFileAlloc(gpa, "abi.txt", max_txt_size) catch |err| switch (err) {
+    //     error.OutOfMemory => return error.OutOfMemory,
+    //     else => {
+    //         std.log.err("unable to read abi.txt: {s}", .{@errorName(err)});
+    //         return error.ZigInstallationCorrupt;
+    //     },
+    // };
+    // defer gpa.free(abi_txt_contents);
+    // {
+    //     var file_it = mem.split(u8, abi_txt_contents, "\n");
+    //     var line_i: usize = 0;
+    //     while (true) {
+    //         const ver_list_base: []VerList = blk: {
+    //             const line = file_it.next() orelse break;
+    //             std.debug.print("ABILINE: {s}\n", .{line});
+    //             if (line.len == 0) break;
+    //             line_i += 1;
+    //             const ver_list_base = try arena.alloc(VerList, all_functions.items.len);
+    //             var line_it = mem.tokenize(u8, line, " ");
+    //             while (line_it.next()) |target_string| {
+    //                 var component_it = mem.tokenize(u8, target_string, "-");
+    //                 const arch_name = component_it.next() orelse {
+    //                     std.log.err("abi.txt:{d}: expected arch name", .{line_i});
+    //                     return error.ZigInstallationCorrupt;
+    //                 };
+    //                 const os_name = component_it.next() orelse {
+    //                     std.log.err("abi.txt:{d}: expected OS name", .{line_i});
+    //                     return error.ZigInstallationCorrupt;
+    //                 };
+    //                 const abi_name = component_it.next() orelse {
+    //                     std.log.err("abi.txt:{d}: expected ABI name", .{line_i});
+    //                     return error.ZigInstallationCorrupt;
+    //                 };
+    //                 const arch_tag = std.meta.stringToEnum(std.Target.Cpu.Arch, arch_name) orelse {
+    //                     std.log.err("abi.txt:{d}: unrecognized arch: '{s}'", .{ line_i, arch_name });
+    //                     return error.ZigInstallationCorrupt;
+    //                 };
+    //                 if (!mem.eql(u8, os_name, "linux")) {
+    //                     std.log.err("abi.txt:{d}: expected OS 'linux', found '{s}'", .{ line_i, os_name });
+    //                     return error.ZigInstallationCorrupt;
+    //                 }
+    //                 const abi_tag = std.meta.stringToEnum(std.Target.Abi, abi_name) orelse {
+    //                     std.log.err("abi.txt:{d}: unrecognized ABI: '{s}'", .{ line_i, abi_name });
+    //                     return error.ZigInstallationCorrupt;
+    //                 };
+
+    //                 const triple = target_util.ArchOsAbi{
+    //                     .arch = arch_tag,
+    //                     .os = .linux,
+    //                     .abi = abi_tag,
+    //                 };
+    //                 try version_table.put(gpa, triple, ver_list_base.ptr);
+    //             }
+    //             break :blk ver_list_base;
+    //         };
+    //         for (ver_list_base) |*ver_list| {
+    //             const line = file_it.next() orelse {
+    //                 std.log.err("abi.txt:{d}: missing version number line", .{line_i});
+    //                 return error.ZigInstallationCorrupt;
+    //             };
+    //             line_i += 1;
+
+    //             ver_list.* = .{
+    //                 .versions = undefined,
+    //                 .len = 0,
+    //             };
+    //             var line_it = mem.tokenize(u8, line, " ");
+    //             while (line_it.next()) |version_index_string| {
+    //                 if (ver_list.len >= ver_list.versions.len) {
+    //                     // If this happens with legit data, increase the array len in the type.
+    //                     std.log.err("abi.txt:{d}: too many versions", .{line_i});
+    //                     return error.ZigInstallationCorrupt;
+    //                 }
+    //                 const version_index = std.fmt.parseInt(u8, version_index_string, 10) catch |err| {
+    //                     // If this happens with legit data, increase the size of the integer type in the struct.
+    //                     std.log.err("abi.txt:{d}: unable to parse version: {s}", .{ line_i, @errorName(err) });
+    //                     return error.ZigInstallationCorrupt;
+    //                 };
+
+    //                 ver_list.versions[ver_list.len] = version_index;
+    //                 ver_list.len += 1;
+    //             }
+    //         }
+    //     }
+    // }
 
     const abi = try arena.create(ABI);
     abi.* = .{
@@ -753,7 +809,7 @@ pub fn buildSharedObjects(comp: *Compilation) !void {
     } else false;
 
     if (!actual_hit) {
-        const metadata = try loadMetaData(comp.gpa, comp.zig_lib_directory.handle);
+        const metadata = try loadMetaData(comp.gpa, comp.zig_lib_directory.handle, target_version);
         defer metadata.destroy(comp.gpa);
 
         const ver_list_base = metadata.version_table.get(.{
