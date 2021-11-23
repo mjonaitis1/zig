@@ -58,7 +58,7 @@ pub const LoadMetaDataError = error{
     OutOfMemory,
 };
 
-pub fn targetStringToTriple(t: []const u8) !target_util.ArchOsAbi{
+pub fn targetStringToTriple(target_string: []const u8) !target_util.ArchOsAbi{
     var component_it = mem.tokenize(u8, target_string, "-");
     const arch_name = component_it.next() orelse {
         std.log.err("symbols: expected arch name", .{});
@@ -97,6 +97,7 @@ pub fn targetStringToTriple(t: []const u8) !target_util.ArchOsAbi{
 pub fn loadMetaData(gpa: *Allocator, zig_lib_dir: std.fs.Dir, target_version: ?std.builtin.Version) LoadMetaDataError!*ABI {
     const tracy = trace(@src());
     defer tracy.end();
+
 
     var arena_allocator = std.heap.ArenaAllocator.init(gpa);
     errdefer arena_allocator.deinit();
@@ -144,6 +145,15 @@ pub fn loadMetaData(gpa: *Allocator, zig_lib_dir: std.fs.Dir, target_version: ?s
         // symbols_data.symbols.items.len includes all inclusions, so symbol
         // duplication will happen.
         const ver_list_base = try arena.alloc(VerList, symbols_data.symbols.items.len);
+
+        // Here we need to make sure that VerList do not have undefined values,
+        // since it is possible for symbol to not be available for certain
+        // target.
+        var i:usize=0;
+        while(i<symbols_data.symbols.items.len):(i+=1){
+          ver_list_base.ptr[i] = .{.len=0, .versions=undefined};
+        }
+
         try version_table.put(gpa, triple, ver_list_base.ptr);
     }
 
@@ -169,115 +179,24 @@ pub fn loadMetaData(gpa: *Allocator, zig_lib_dir: std.fs.Dir, target_version: ?s
         // Populate verlist
         for(symbol.targets.items)|target_string|{
             const triple = try targetStringToTriple(target_string);
-            var version_table_gop = version_table.getOrPut(triple);
+            var version_table_gop = try version_table.getOrPut(gpa, triple);
             if(version_table_gop.found_existing){
                 // TODO use all versions correctly. Now this is for testing only
-                var glibc_version_index = 0;
-                for(all_versions)|version_string, version_index|{
+                var glibc_version_index:u8 = 0;
+                for(symbols_data.all_versions.items)|version_string, version_index|{
                     if(std.mem.eql(u8, symbol.versions.items[0], version_string)){
-                        glibc_version_index = version_index;
+                        glibc_version_index = @truncate(u8, version_index);
                         break;
                     }
                 }
-
+                glibc_version_index = 10;
+                // std.debug.print("symbol: {s} {d} \n", .{symbol.name, symbol});
                 // This is a pointer to ver_list_base which has a length of symbols_data.symbols.items.len
-                version_table_gop.value_ptr[symbol_i] = .{
-                    .versions = [1]u8{glibc_version_index},
-                    .len = 1,
-                };
+                version_table_gop.value_ptr.*[symbol_i].versions[0] = glibc_version_index;
+                version_table_gop.value_ptr.*[symbol_i].len = 1;
             }
         }
     }
-
-
-
-
-    // const max_txt_size = 500 * 1024; // Bigger than this and something is definitely borked.
-    // const abi_txt_contents = glibc_dir.readFileAlloc(gpa, "abi.txt", max_txt_size) catch |err| switch (err) {
-    //     error.OutOfMemory => return error.OutOfMemory,
-    //     else => {
-    //         std.log.err("unable to read abi.txt: {s}", .{@errorName(err)});
-    //         return error.ZigInstallationCorrupt;
-    //     },
-    // };
-    // defer gpa.free(abi_txt_contents);
-    // {
-    //     var file_it = mem.split(u8, abi_txt_contents, "\n");
-    //     var line_i: usize = 0;
-    //     while (true) {
-    //         const ver_list_base: []VerList = blk: {
-    //             const line = file_it.next() orelse break;
-    //             std.debug.print("ABILINE: {s}\n", .{line});
-    //             if (line.len == 0) break;
-    //             line_i += 1;
-    //             const ver_list_base = try arena.alloc(VerList, all_functions.items.len);
-    //             var line_it = mem.tokenize(u8, line, " ");
-    //             while (line_it.next()) |target_string| {
-    //                 var component_it = mem.tokenize(u8, target_string, "-");
-    //                 const arch_name = component_it.next() orelse {
-    //                     std.log.err("abi.txt:{d}: expected arch name", .{line_i});
-    //                     return error.ZigInstallationCorrupt;
-    //                 };
-    //                 const os_name = component_it.next() orelse {
-    //                     std.log.err("abi.txt:{d}: expected OS name", .{line_i});
-    //                     return error.ZigInstallationCorrupt;
-    //                 };
-    //                 const abi_name = component_it.next() orelse {
-    //                     std.log.err("abi.txt:{d}: expected ABI name", .{line_i});
-    //                     return error.ZigInstallationCorrupt;
-    //                 };
-    //                 const arch_tag = std.meta.stringToEnum(std.Target.Cpu.Arch, arch_name) orelse {
-    //                     std.log.err("abi.txt:{d}: unrecognized arch: '{s}'", .{ line_i, arch_name });
-    //                     return error.ZigInstallationCorrupt;
-    //                 };
-    //                 if (!mem.eql(u8, os_name, "linux")) {
-    //                     std.log.err("abi.txt:{d}: expected OS 'linux', found '{s}'", .{ line_i, os_name });
-    //                     return error.ZigInstallationCorrupt;
-    //                 }
-    //                 const abi_tag = std.meta.stringToEnum(std.Target.Abi, abi_name) orelse {
-    //                     std.log.err("abi.txt:{d}: unrecognized ABI: '{s}'", .{ line_i, abi_name });
-    //                     return error.ZigInstallationCorrupt;
-    //                 };
-
-    //                 const triple = target_util.ArchOsAbi{
-    //                     .arch = arch_tag,
-    //                     .os = .linux,
-    //                     .abi = abi_tag,
-    //                 };
-    //                 try version_table.put(gpa, triple, ver_list_base.ptr);
-    //             }
-    //             break :blk ver_list_base;
-    //         };
-    //         for (ver_list_base) |*ver_list| {
-    //             const line = file_it.next() orelse {
-    //                 std.log.err("abi.txt:{d}: missing version number line", .{line_i});
-    //                 return error.ZigInstallationCorrupt;
-    //             };
-    //             line_i += 1;
-
-    //             ver_list.* = .{
-    //                 .versions = undefined,
-    //                 .len = 0,
-    //             };
-    //             var line_it = mem.tokenize(u8, line, " ");
-    //             while (line_it.next()) |version_index_string| {
-    //                 if (ver_list.len >= ver_list.versions.len) {
-    //                     // If this happens with legit data, increase the array len in the type.
-    //                     std.log.err("abi.txt:{d}: too many versions", .{line_i});
-    //                     return error.ZigInstallationCorrupt;
-    //                 }
-    //                 const version_index = std.fmt.parseInt(u8, version_index_string, 10) catch |err| {
-    //                     // If this happens with legit data, increase the size of the integer type in the struct.
-    //                     std.log.err("abi.txt:{d}: unable to parse version: {s}", .{ line_i, @errorName(err) });
-    //                     return error.ZigInstallationCorrupt;
-    //                 };
-
-    //                 ver_list.versions[ver_list.len] = version_index;
-    //                 ver_list.len += 1;
-    //             }
-    //         }
-    //     }
-    // }
 
     const abi = try arena.create(ABI);
     abi.* = .{
@@ -817,6 +736,7 @@ pub fn buildSharedObjects(comp: *Compilation) !void {
             .os = target.os.tag,
             .abi = target.abi,
         }) orelse return error.GLibCUnavailableForThisTarget;
+
         const target_ver_index = for (metadata.all_versions) |ver, i| {
             switch (ver.order(target_version)) {
                 .eq => break i,
@@ -856,6 +776,7 @@ pub fn buildSharedObjects(comp: *Compilation) !void {
                 if (libc_fn.lib != lib) continue;
 
                 const ver_list = ver_list_base[fn_i];
+                std.debug.print("Ver_list: len {d}, versions len: {d} \n", .{ver_list.len, ver_list.versions.len});
                 // Pick the default symbol version:
                 // - If there are no versions, don't emit it
                 // - Take the greatest one <= than the target one
@@ -865,7 +786,7 @@ pub fn buildSharedObjects(comp: *Compilation) !void {
                 var chosen_def_ver_index: u8 = 255;
                 {
                     var ver_i: u8 = 0;
-                    while (ver_i < ver_list.len) : (ver_i += 1) {
+                    while (ver_i < ver_list.len-1) : (ver_i += 1) {
                         const ver_index = ver_list.versions[ver_i];
                         if ((chosen_def_ver_index == 255 or ver_index > chosen_def_ver_index) and
                             target_ver_index >= ver_index)
