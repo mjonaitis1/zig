@@ -17,6 +17,29 @@ pub const Lib = struct {
     sover: u8,
 };
 
+// This order is used in binary encoding and must not be changed.
+const lib_names = [_][]const u8{
+    "c",
+    "dl",
+    "m",
+    "pthread",
+    "rt",
+    "ld",
+    "util",
+};
+
+// quick helper to get index from lib_names
+pub fn getLibI(lib_name: []const u8) !u8{
+    for(lib_names)|l_name, lib_i|{
+        if(std.mem.eql(u8, lib_name, l_name)){
+            return @truncate(u8, lib_i);
+        }
+    }
+
+    std.debug.print("library: lib{s} does not exist \n", .{lib_name});
+    return error.ZigInstallationCorrupt;
+}
+
 pub const Fn = struct {
     name: []const u8,
     lib: *const Lib,
@@ -58,7 +81,7 @@ pub const LoadMetaDataError = error{
     OutOfMemory,
 };
 
-pub fn targetStringToTriple(target_string: []const u8) !target_util.ArchOsAbi{
+pub fn targetStringToTriple(target_string: []const u8) !target_util.ArchOsAbi {
     var component_it = mem.tokenize(u8, target_string, "-");
     const arch_name = component_it.next() orelse {
         std.log.err("symbols: expected arch name", .{});
@@ -73,15 +96,15 @@ pub fn targetStringToTriple(target_string: []const u8) !target_util.ArchOsAbi{
         return error.ZigInstallationCorrupt;
     };
     const arch_tag = std.meta.stringToEnum(std.Target.Cpu.Arch, arch_name) orelse {
-        std.log.err("symbols: unrecognized arch: '{s}'", .{ arch_name });
+        std.log.err("symbols: unrecognized arch: '{s}'", .{arch_name});
         return error.ZigInstallationCorrupt;
     };
     if (!mem.eql(u8, os_name, "linux")) {
-        std.log.err("symbols: expected OS 'linux', found '{s}'", .{ os_name });
+        std.log.err("symbols: expected OS 'linux', found '{s}'", .{os_name});
         return error.ZigInstallationCorrupt;
     }
     const abi_tag = std.meta.stringToEnum(std.Target.Abi, abi_name) orelse {
-        std.log.err("symbols: unrecognized ABI: '{s}'", .{ abi_name });
+        std.log.err("symbols: unrecognized ABI: '{s}'", .{abi_name});
         return error.ZigInstallationCorrupt;
     };
     const triple = target_util.ArchOsAbi{
@@ -97,7 +120,6 @@ pub fn targetStringToTriple(target_string: []const u8) !target_util.ArchOsAbi{
 pub fn loadMetaData(gpa: *Allocator, zig_lib_dir: std.fs.Dir, target_version: ?std.builtin.Version) LoadMetaDataError!*ABI {
     const tracy = trace(@src());
     defer tracy.end();
-
 
     var arena_allocator = std.heap.ArenaAllocator.init(gpa);
     errdefer arena_allocator.deinit();
@@ -149,51 +171,56 @@ pub fn loadMetaData(gpa: *Allocator, zig_lib_dir: std.fs.Dir, target_version: ?s
         // Here we need to make sure that VerList do not have undefined values,
         // since it is possible for symbol to not be available for certain
         // target.
-        var i:usize=0;
-        while(i<symbols_data.symbols.items.len):(i+=1){
-          ver_list_base.ptr[i] = .{.len=0, .versions=undefined};
+        var i: usize = 0;
+        while (i < symbols_data.symbols.items.len) : (i += 1) {
+            ver_list_base.ptr[i] = .{ .len = 0, .versions = undefined };
         }
 
         try version_table.put(gpa, triple, ver_list_base.ptr);
     }
 
     // Collect symbols information
-    // TODO - remove included_symbols once target_version check is added
-    // var included_symbols = std.StringHashMap(bool).init(arena_allocator);
     for (symbols_data.symbols.items) |symbol, symbol_i| {
-        // // Prevent double inclusion of symbols - temporary solution
-        // const gop = included_symbols.getOrPut(symbol.name);
-        // if(gop.found_existing){
-        //     continue;
-        // }
-
         const lib = findLib(symbol.lib) orelse {
             std.log.err("symbols:{s} unknown library name: {s}", .{ symbol.name, symbol.lib });
             return error.ZigInstallationCorrupt;
         };
+
         try all_functions.append(arena, .{
             .name = symbol.name,
             .lib = lib,
         });
 
-        // Populate verlist
-        for(symbol.targets.items)|target_string|{
+        // Populate verlist for targets
+        for (symbol.targets.items) |target_string| {
             const triple = try targetStringToTriple(target_string);
+            const target_name = try std.fmt.allocPrint(gpa, "{s}-{s}-{s}", .{@tagName(triple.arch), @tagName(triple.os), @tagName(triple.abi)});
+
+            // For current target and current lib of this symbol, get the list of versions available in lib.
+            const versions_indexes_in_target_lib = symbols_data.versions_in_libs.get(target_name).?[
+                try getLibI(lib.name)
+            ].items;
+
+            // Since versions are sorted in asc order - we can simply take the last value
+            const max_version_in_lib = versions_indexes_in_target_lib[versions_indexes_in_target_lib.len-1];
+
             var version_table_gop = try version_table.getOrPut(gpa, triple);
-            if(version_table_gop.found_existing){
-                // TODO use all versions correctly. Now this is for testing only
-                var glibc_version_index:u8 = 0;
-                for(symbols_data.all_versions.items)|version_string, version_index|{
-                    if(std.mem.eql(u8, symbol.versions.items[0], version_string)){
-                        glibc_version_index = @truncate(u8, version_index);
-                        break;
+            if (version_table_gop.found_existing) {
+                var glibc_version_index: u8 = 0;
+                for (symbols_data.all_versions.items) |version_string, version_index| {
+                    for(symbol.versions.items) |symbol_version_string|{
+                        if (std.mem.eql(u8, symbol_version_string, version_string)) {
+                            glibc_version_index = @truncate(u8, version_index);
+
+                            // Allow up to maximum available version for current target in current lib
+                            if(max_version_in_lib >= glibc_version_index){
+                                // This is a pointer to ver_list_base which has a length of symbols_data.symbols.items.len
+                                version_table_gop.value_ptr.*[symbol_i].versions[version_table_gop.value_ptr.*[symbol_i].len] = glibc_version_index;
+                                version_table_gop.value_ptr.*[symbol_i].len += 1;
+                            }
+                        }
                     }
                 }
-                glibc_version_index = 10;
-                // std.debug.print("symbol: {s} {d} \n", .{symbol.name, symbol});
-                // This is a pointer to ver_list_base which has a length of symbols_data.symbols.items.len
-                version_table_gop.value_ptr.*[symbol_i].versions[0] = glibc_version_index;
-                version_table_gop.value_ptr.*[symbol_i].len = 1;
             }
         }
     }
@@ -776,7 +803,6 @@ pub fn buildSharedObjects(comp: *Compilation) !void {
                 if (libc_fn.lib != lib) continue;
 
                 const ver_list = ver_list_base[fn_i];
-                std.debug.print("Ver_list: len {d}, versions len: {d} \n", .{ver_list.len, ver_list.versions.len});
                 // Pick the default symbol version:
                 // - If there are no versions, don't emit it
                 // - Take the greatest one <= than the target one
@@ -786,7 +812,7 @@ pub fn buildSharedObjects(comp: *Compilation) !void {
                 var chosen_def_ver_index: u8 = 255;
                 {
                     var ver_i: u8 = 0;
-                    while (ver_i < ver_list.len-1) : (ver_i += 1) {
+                    while (ver_i < ver_list.len - 1) : (ver_i += 1) {
                         const ver_index = ver_list.versions[ver_i];
                         if ((chosen_def_ver_index == 255 or ver_index > chosen_def_ver_index) and
                             target_ver_index >= ver_index)
